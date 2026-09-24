@@ -13,8 +13,8 @@ Luồng tensor
     RGB [B,3,H,W], giá trị [0,1]
       -> ImageNet normalization
       -> ResNet-34 backbone
-      -> FPN 160 channels @ stride 4
-          |-> depth decoder: [B,64,H/4,W/4]
+      -> top-down FPN 160 channels: P2/P3/P4 @ stride 4/8/16
+          |-> P2 depth decoder: [B,64,H/4,W/4]
           |      -> softmax 64 bins -> expected metric depth [B,H/4,W/4]
           `-> CenterNet detector 3 scale
                  s4  : object < 40 px
@@ -43,6 +43,8 @@ import json
 import math
 from pathlib import Path
 import pickle
+import sys
+import tempfile
 from typing import Any, Iterable
 
 import numpy as np
@@ -1812,11 +1814,172 @@ def run_navsim_smoke(args: argparse.Namespace) -> None:
     )
 
 
+def run_navsim_e2e(args: argparse.Namespace) -> None:
+    """Chạy trọn pipeline NAVSIM bằng một lệnh và chỉ giữ artifact cuối.
+
+    Profile ``full`` tái hiện progressive resizing đã được kiểm chứng:
+    144p -> 216p -> 432p. Hai checkpoint trung gian nằm trong temporary
+    directory bên trong output và được tự xoá sau khi phase cuối thành công.
+    Profile ``quick`` chạy một phase rất nhỏ để kiểm tra installation/I/O.
+    """
+    dataset_root = Path(args.navsim_root).resolve()
+    logs_root = dataset_root / "navsim_logs" / "mini"
+    sensors_root = dataset_root / "sensor_blobs" / "mini"
+    if not logs_root.is_dir() or not sensors_root.is_dir():
+        raise FileNotFoundError(
+            "NAVSIM root must contain navsim_logs/mini and sensor_blobs/mini: "
+            f"{dataset_root}"
+        )
+    metadata_files = len(list(logs_root.glob("*.pkl")))
+    sensor_scenes = len([path for path in sensors_root.iterdir() if path.is_dir()])
+    if metadata_files < 2 or sensor_scenes < 2:
+        raise RuntimeError(
+            "End-to-end training needs at least two NAVSIM recordings; "
+            f"found metadata={metadata_files}, sensor_scenes={sensor_scenes}"
+        )
+
+    device = torch.device(
+        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda requested but torch.cuda.is_available() is false")
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
+    elif args.e2e_profile == "full":
+        print(
+            "warning: full profile is running on CPU and will be very slow",
+            flush=True,
+        )
+
+    if args.e2e_profile == "quick":
+        phases = [
+            {
+                "name": "quick",
+                "train_samples": 8,
+                "validation_samples": 4,
+                "epochs": 1,
+                "batch_size": 2,
+                "image_width": 192,
+                "image_height": 128,
+                "learning_rate": 1e-4,
+                "depth_weight": 0.10,
+                "unfreeze_backbone_stages": 0,
+            }
+        ]
+    else:
+        phases = [
+            {
+                "name": "stage1_144p",
+                "train_samples": 512,
+                "validation_samples": 32,
+                "epochs": 6,
+                "batch_size": 4,
+                "image_width": 256,
+                "image_height": 144,
+                "learning_rate": 3e-4,
+                "depth_weight": 0.15,
+                "unfreeze_backbone_stages": 2,
+            },
+            {
+                "name": "stage2_216p",
+                "train_samples": 768,
+                "validation_samples": 32,
+                "epochs": 3,
+                "batch_size": 4,
+                "image_width": 384,
+                "image_height": 216,
+                "learning_rate": 1.5e-4,
+                "depth_weight": 0.10,
+                "unfreeze_backbone_stages": 2,
+            },
+            {
+                "name": "final_432p",
+                "train_samples": 1024,
+                "validation_samples": 128,
+                "epochs": 3,
+                "batch_size": 4,
+                "image_width": 768,
+                "image_height": 432,
+                "learning_rate": 7.5e-5,
+                "depth_weight": 0.10,
+                "unfreeze_backbone_stages": 2,
+            },
+        ]
+
+    output_dir = Path(args.smoke_output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    index_path = output_dir / "navsim_index.json"
+    print(
+        f"NAVSIM E2E profile={args.e2e_profile} device={device} "
+        f"recordings={metadata_files} output={output_dir}",
+        flush=True,
+    )
+
+    previous_checkpoint = ""
+    with tempfile.TemporaryDirectory(
+        prefix=".progressive-stages-", dir=output_dir
+    ) as temporary_root:
+        temporary_root_path = Path(temporary_root)
+        for phase_index, phase in enumerate(phases):
+            is_final = phase_index == len(phases) - 1
+            phase_output = (
+                output_dir
+                if is_final
+                else temporary_root_path / str(phase["name"])
+            )
+            phase_args = argparse.Namespace(
+                **{
+                    **vars(args),
+                    **phase,
+                    "navsim_index": str(index_path),
+                    "rebuild_navsim_index": phase_index == 0,
+                    "max_index_samples": None,
+                    "smoke_output_dir": str(phase_output),
+                    "smoke_score_threshold": 0.20,
+                    "resume_smoke_checkpoint": "",
+                    "init_checkpoint": previous_checkpoint,
+                    "device": str(device),
+                    "amp": device.type == "cuda",
+                    "num_workers": 2 if device.type == "cuda" else 0,
+                    "backbone_lr_scale": 0.1,
+                    "gradient_clip": 5.0,
+                    "log_every": 20,
+                    "train_backbone": False,
+                    "no_train_augmentation": False,
+                    "uniform_training_sampling": False,
+                    # Chỉ phase đầu cần ImageNet initialization. Phase sau
+                    # nạp toàn bộ weights từ checkpoint trước.
+                    "no_pretrained_backbone": (
+                        args.no_pretrained_backbone if phase_index == 0 else True
+                    ),
+                }
+            )
+            print(
+                f"E2E phase {phase_index + 1}/{len(phases)}: {phase['name']} "
+                f"samples={phase['train_samples']} epochs={phase['epochs']} "
+                f"resolution={phase['image_height']}x{phase['image_width']}",
+                flush=True,
+            )
+            run_navsim_smoke(phase_args)
+            previous_checkpoint = str(phase_output / "navsim_smoke.pt")
+
+    final_checkpoint = output_dir / "navsim_smoke.pt"
+    final_result = output_dir / "result.json"
+    if not final_checkpoint.is_file() or not final_result.is_file():
+        raise RuntimeError("E2E completed without final checkpoint/result")
+    print(
+        "NAVSIM E2E complete; intermediate checkpoints removed; "
+        f"checkpoint={final_checkpoint} result={final_result}",
+        flush=True,
+    )
+
+
 # =============================================================================
 # BLOCK 10 — CHECKPOINT I/O
 # =============================================================================
 
-def load_checkpoint(model: nn.Module, checkpoint_path: str) -> None:
+def load_checkpoint(model: nn.Module, checkpoint_path: str) -> dict[str, Any]:
     """Nạp checkpoint và fail-fast nếu kiến trúc không khớp.
 
     Chấp nhận raw state_dict hoặc dict có key ``model``; tự bỏ prefix ``module.``
@@ -1834,6 +1997,7 @@ def load_checkpoint(model: nn.Module, checkpoint_path: str) -> None:
             f"checkpoint is not compatible: missing={missing[:8]}, "
             f"unexpected={unexpected[:8]}"
         )
+    return raw if isinstance(raw, dict) and "model" in raw else {}
 
 
 # =============================================================================
@@ -1886,13 +2050,31 @@ def self_test() -> None:
 # =============================================================================
 
 def main() -> None:
-    """CLI cho self-test, NAVSIM smoke pipeline hoặc inference checkpoint."""
+    """CLI cho E2E NAVSIM training, stage nâng cao, self-test và inference."""
+    # Windows console có thể mặc định cp1252 và crash chỉ vì workspace/path có
+    # tiếng Việt. Reconfigure ngay tại CLI để mọi log E2E luôn in được.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument(
-        "--navsim-smoke",
+        "--navsim-e2e",
         action="store_true",
-        help="build portable NAVSIM index, smoke-train and export held-out result",
+        help="raw NAVSIM -> index -> progressive GPU train -> validation artifacts",
+    )
+    parser.add_argument(
+        "--e2e-profile",
+        choices=("full", "quick"),
+        default="full",
+        help="full trains 144p/216p/432p; quick only verifies the complete pipeline",
+    )
+    parser.add_argument(
+        "--navsim-stage",
+        "--navsim-smoke",
+        dest="navsim_smoke",
+        action="store_true",
+        help="advanced: run one configurable NAVSIM train/evaluation stage",
     )
     parser.add_argument(
         "--navsim-root", default=r"D:\navsim_workspace\dataset"
@@ -1917,7 +2099,7 @@ def main() -> None:
     parser.add_argument("--image-width", type=int, default=192)
     parser.add_argument("--image-height", type=int, default=108)
     parser.add_argument("--smoke-score-threshold", type=float, default=0.20)
-    parser.add_argument("--smoke-output-dir", default="artifacts/navsim_smoke")
+    parser.add_argument("--smoke-output-dir", default="artifacts/navsim_e2e")
     parser.add_argument("--resume-smoke-checkpoint", default="")
     parser.add_argument(
         "--init-checkpoint",
@@ -1940,7 +2122,7 @@ def main() -> None:
     parser.add_argument("--output", default="result.jpg")
     parser.add_argument("--json-output", default="result.json")
     parser.add_argument("--device", default=None)
-    parser.add_argument("--score-threshold", type=float, default=0.3)
+    parser.add_argument("--score-threshold", type=float, default=0.20)
     parser.add_argument("--fx", type=float)
     parser.add_argument("--fy", type=float)
     parser.add_argument("--cx", type=float)
@@ -1950,6 +2132,9 @@ def main() -> None:
 
     if args.self_test:
         self_test()
+        return
+    if args.navsim_e2e:
+        run_navsim_e2e(args)
         return
     if args.navsim_smoke:
         run_navsim_smoke(args)
@@ -1961,7 +2146,10 @@ def main() -> None:
         )
 
     model = MeteorLikeVRUDepthModel(pretrained_backbone=False)
-    load_checkpoint(model, args.checkpoint)
+    checkpoint_payload = load_checkpoint(model, args.checkpoint)
+    checkpoint_hw = tuple(
+        checkpoint_payload.get("config", {}).get("image_hw", (432, 768))
+    )
     transform = (
         None
         if not args.ego_from_camera_npy
@@ -1971,6 +2159,7 @@ def main() -> None:
         model,
         CameraCalibration(args.fx, args.fy, args.cx, args.cy, transform),
         device=args.device,
+        input_hw=checkpoint_hw,
     )
     image = Image.open(args.image).convert("RGB")
     objects, _ = pipeline.predict(image, args.score_threshold)
