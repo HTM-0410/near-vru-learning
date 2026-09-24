@@ -24,7 +24,46 @@ Luồng tensor
       -> decode box + class-wise NMS
       -> lấy depth bền vững trong lower-central region của bbox
       -> pinhole unprojection: pixel + camera-Z -> camera XYZ
-      -> optional camera->ego transform -> ego ground distance
+       -> optional camera->ego transform -> ego ground distance
+
+Ba quy trình chạy
+-----------------
+
+1. Training NAVSIM (``--navsim-e2e`` hoặc ``--navsim-stage``)
+
+   ``main`` chọn chế độ -> Block 9 đọc metadata/camera/LiDAR -> chiếu GT 3D thành
+   bbox 2D và sparse camera-Z -> ``NavsimFrontDataset`` resize/augment dữ liệu ->
+   Block 4 forward -> Block 5 tính detection loss và depth loss -> optimizer cập
+   nhật trọng số -> validation decode bằng Block 6 -> lưu checkpoint/artifact.
+   ``--navsim-e2e`` gọi quy trình này nhiều stage với độ phân giải tăng dần.
+
+2. Inference một ảnh (``--image ... --checkpoint ...``)
+
+   ``main`` nạp checkpoint bằng Block 10 -> tạo ``InferencePipeline`` ở Block 8
+   -> resize ảnh đúng resolution đã train -> Block 4 dự đoán raw tensors -> Block
+   6 decode bbox/NMS -> Block 7 lấy depth bền vững trong bbox và unproject sang
+   3D -> gán dải ``critical/near/far`` -> ghi ảnh chú thích và JSON.
+
+3. Tự kiểm tra (``--self-test``)
+
+   Block 11 tạo tensor tổng hợp để kiểm tra shape, log-depth bins, decode bbox,
+   phép chiếu 3D và checkpoint compatibility mà không cần NAVSIM/checkpoint thật.
+
+Bản đồ 12 block
+---------------
+
+* Block 1: định nghĩa taxonomy, detection scales và quy ước depth dùng chung.
+* Block 2: khối convolution tái sử dụng trong FPN và các prediction head.
+* Block 3: data contract có kiểu rõ ràng giữa model, geometry và ứng dụng.
+* Block 4: mạng học sâu và forward tạo depth/detection tensors thô.
+* Block 5: biến ground truth thành target rồi tính các loss khi training.
+* Block 6: biến heatmap/regression thành bbox cuối và loại box trùng bằng NMS.
+* Block 7: ghép bbox với depth map để suy ra camera/ego 3D distance.
+* Block 8: điều phối toàn bộ inference trên một ảnh và vẽ kết quả.
+* Block 9: adapter NAVSIM, Dataset/DataLoader, training và validation artifacts.
+* Block 10: nạp checkpoint có kiểm tra chặt kiến trúc/depth semantics.
+* Block 11: smoke test bằng dữ liệu tổng hợp.
+* Block 12: CLI chọn đúng một trong các quy trình phía trên.
 
 Phạm vi
 --------
@@ -61,6 +100,10 @@ from torch.utils.data import DataLoader, Dataset
 # BLOCK 1 — HẰNG SỐ VÀ QUY ƯỚC MODEL
 # =============================================================================
 
+# Đây là "single source of truth" cho ý nghĩa output/label. Thay các giá trị ở
+# đây có thể làm checkpoint cũ không còn tương thích dù số tensor vẫn giống nhau.
+# Block 4/5/6/7/9 đều đọc các hằng số này để train và inference cùng một quy ước.
+
 # Taxonomy rút gọn. Tất cả pedestrian/cyclist/motorcyclist phải được convert về
 # class 1 ở bước chuẩn bị label; ô tô/bus/truck... convert về class 0.
 CLASS_NAMES = ("vehicle", "vru")
@@ -72,16 +115,22 @@ DET_STRIDES = (4, 8, 16)
 # Quy tắc gán GT theo cạnh dài nhất của bbox, giống detection pyramid METEOR.
 DET_SIZE_SPLITS = (40.0, 120.0)
 
-# Depth classification: centre(i) = 1.0 + i*1.25 m, i=0..63.
-# Bin cuối có tâm 79.75 m.
+# D5/current METEOR depth discretization: 64 geometric/log-spaced centres.
+# Vùng gần có khoảng bin nhỏ để giữ precision cho VRU gần; vùng xa dùng bin
+# rộng hơn. Đây không phải một hằng ``step`` theo mét.
 DEPTH_BINS = 64
 DEPTH_MIN_M = 1.0
-DEPTH_STEP_M = 1.25
+DEPTH_MAX_M = 79.75
+DEPTH_BINNING = "log_geomspace_1_79.75_64_v1"
+DEPTH_MODAL_RADIUS = 2
 
 
 # =============================================================================
 # BLOCK 2 — KHỐI CONV DÙNG CHUNG
 # =============================================================================
+
+# Primitive học feature dùng lặp lại trong FPN, depth head và detection head.
+# Padding=1 giữ nguyên HxW; BatchNorm ổn định activation; ReLU thêm phi tuyến.
 
 class ConvBlock(nn.Sequential):
     """Hai lớp Conv-BN-ReLU giữ nguyên kích thước không gian."""
@@ -100,6 +149,10 @@ class ConvBlock(nn.Sequential):
 # =============================================================================
 # BLOCK 3 — DATA CONTRACT: CALIBRATION, DETECTION, DEPTH VÀ OUTPUT
 # =============================================================================
+
+# Các dataclass đặt tên/đơn vị/hệ tọa độ cho dữ liệu đi qua pipeline. Mục tiêu là
+# không nhầm raw model tensor với bbox đã decode, camera-Z với Euclidean range,
+# hoặc camera frame với ego frame khi ghép các block độc lập.
 
 @dataclass(frozen=True)
 class CameraCalibration:
@@ -180,6 +233,11 @@ class ModelOutput:
 # BLOCK 4 — KIẾN TRÚC MODEL: RESNET-34 + FPN + DEPTH + DETECTION
 # =============================================================================
 
+# Đây là phần neural network thật sự. Backbone trích feature nhiều độ phân giải;
+# FPN truyền semantic từ feature sâu xuống feature chi tiết; các head dùng chung
+# feature rồi tách thành depth và detection. ``forward`` chỉ trả tensor thô để
+# vẫn differentiable khi train; threshold/NMS/3D geometry nằm ở block sau.
+
 class MeteorLikeVRUDepthModel(nn.Module):
     """Shared ResNet-34/FPN model for depth and Vehicle/VRU detection."""
 
@@ -245,7 +303,13 @@ class MeteorLikeVRUDepthModel(nn.Module):
             nn.init.zeros_(head.bias)
 
         # Các buffer này đi theo device của model nhưng không phải parameter.
-        bins = DEPTH_MIN_M + torch.arange(DEPTH_BINS) * DEPTH_STEP_M
+        bins = torch.exp(
+            torch.linspace(
+                math.log(DEPTH_MIN_M),
+                math.log(DEPTH_MAX_M),
+                DEPTH_BINS,
+            )
+        )
         self.register_buffer("depth_centres_m", bins, persistent=False)
         self.register_buffer(
             "image_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None],
@@ -300,10 +364,7 @@ class MeteorLikeVRUDepthModel(nn.Module):
         # Depth expectation E[z] = sum_i P(bin_i)*centre_i. Giữ depth_logits
         # riêng vì training cần cross-entropy trên bin, còn inference dùng E[z].
         depth_logits = self.depth_head(feature_s4)
-        depth_probability = depth_logits.float().softmax(1)
-        depth_m = (
-            depth_probability * self.depth_centres_m[None, :, None, None]
-        ).sum(1)
+        depth_m = self.metric_depth_from_logits(depth_logits)
 
         # Mỗi detection head nhận trực tiếp đúng mức top-down FPN của nó.
         det4 = self.det_s4(feature_s4)
@@ -316,9 +377,62 @@ class MeteorLikeVRUDepthModel(nn.Module):
         )
         return ModelOutput(depth_logits, depth_m, heatmaps, regressions)
 
+    def metric_depth_to_bin(self, depth_m: torch.Tensor) -> torch.Tensor:
+        """Đổi metric depth thành tọa độ bin liên tục trên geometric centres.
+
+        Giống METEOR D5: ``bucketize`` tìm hai tâm bao quanh rồi nội suy tuyến
+        tính trong chính khoảng log-spaced đó. Giá trị trả về chưa round để có
+        thể dùng cho interpolation; CE target sẽ round ở ``depth_loss``.
+        """
+        centres = self.depth_centres_m.to(
+            device=depth_m.device, dtype=depth_m.dtype
+        )
+        upper = torch.bucketize(depth_m.detach(), centres).clamp(
+            1, DEPTH_BINS - 1
+        )
+        lower = upper - 1
+        low_depth = centres[lower]
+        high_depth = centres[upper]
+        fraction = ((depth_m - low_depth) / (high_depth - low_depth)).clamp(
+            0.0, 1.0
+        )
+        return lower.to(depth_m.dtype) + fraction
+
+    def metric_depth_from_logits(
+        self,
+        depth_logits: torch.Tensor,
+        modal_radius: int | None = None,
+    ) -> torch.Tensor:
+        """Decode distribution thành metric camera-Z theo log-bin centres.
+
+        Train dùng full expectation để gradient tới mọi bin. Inference dùng
+        ``modal_radius=2`` giống METEOR deployment: chỉ kỳ vọng trên peak ±2,
+        tránh foreground/background hai mode tạo một depth giả ở giữa.
+        """
+        probability = depth_logits.float().softmax(1)
+        if modal_radius is not None:
+            peak = probability.argmax(1, keepdim=True)
+            indices = torch.arange(
+                DEPTH_BINS, device=probability.device
+            ).view(1, DEPTH_BINS, 1, 1)
+            window = (indices - peak).abs() <= modal_radius
+            probability = probability * window.to(probability.dtype)
+            probability = probability / probability.sum(
+                1, keepdim=True
+            ).clamp(min=1e-6)
+        centres = self.depth_centres_m.to(
+            device=probability.device, dtype=probability.dtype
+        )
+        return (probability * centres[None, :, None, None]).sum(1)
+
     # =========================================================================
     # BLOCK 5 — TARGET VÀ LOSS CHO TRAINING
     # =========================================================================
+
+    # Chỉ được dùng khi có ground truth. Bbox được gán đúng một pyramid scale,
+    # rasterize thành Gaussian center + offset/size target; depth thật theo mét
+    # được đổi sang log-bin. Loss giữ positive đồng đều và dùng OHEM cho negative
+    # khó, sau đó training loop ở Block 9 mới cộng detection/depth loss.
 
     @staticmethod
     def _gaussian_targets(
@@ -529,11 +643,11 @@ class MeteorLikeVRUDepthModel(nn.Module):
         return ((1.0 - giou) * positive).sum() / positive.sum().clamp(min=1)
 
     def depth_loss(self, output: ModelOutput, depth_gt_m: torch.Tensor) -> torch.Tensor:
-        """Depth loss = 64-bin cross entropy + 0.1*metric L1.
+        """Log-bin CE + 0.1*continuous metric L1, giống METEOR D5/V14.
 
-        ``depth_gt_m`` là camera-Z theo mét, không phải inverse/relative depth.
-        Pixel ngoài [1.0,79.75] m hoặc không finite bị ignore. CE học phân phối
-        bin; L1 giữ expected depth đúng đơn vị mét và hạn chế scale drift.
+        ``depth_gt_m`` luôn là camera-Z thật theo mét. Binning chỉ encode CE;
+        L1 vẫn so full expected depth với GT liên tục. Pixel ngoài geometric
+        range [1.0,79.75] m hoặc không finite bị ignore.
         """
         if depth_gt_m.ndim == 4:
             depth_gt_m = depth_gt_m[:, 0]
@@ -543,11 +657,12 @@ class MeteorLikeVRUDepthModel(nn.Module):
                 output.depth_logits.shape[-2:],
                 mode="nearest",
             )[:, 0]
-        continuous_bin = (depth_gt_m - DEPTH_MIN_M) / DEPTH_STEP_M
+        continuous_bin = self.metric_depth_to_bin(depth_gt_m.float())
         target_bin = continuous_bin.round().long()
         valid = (
             torch.isfinite(depth_gt_m)
             & (depth_gt_m >= DEPTH_MIN_M)
+            & (depth_gt_m <= DEPTH_MAX_M)
             & (target_bin >= 0)
             & (target_bin < DEPTH_BINS)
         )
@@ -566,6 +681,10 @@ class MeteorLikeVRUDepthModel(nn.Module):
     # =========================================================================
     # BLOCK 6 — DECODE HEATMAP THÀNH BBOX VÀ NMS
     # =========================================================================
+
+    # Đây là hậu xử lý detection khi validation/inference: sigmoid heatmap ->
+    # lọc local maximum/score -> giải mã offset và kích thước về pixel ảnh ->
+    # class-wise NMS. Kết quả là ``Detection``; block này chưa tính khoảng cách.
 
     @staticmethod
     def decode(
@@ -643,6 +762,11 @@ class MeteorLikeVRUDepthModel(nn.Module):
 # BLOCK 7 — TỪ DEPTH MAP + BBOX ĐẾN KHOẢNG CÁCH 3D
 # =============================================================================
 
+# Cầu nối giữa perception 2D và metric geometry. Hàm lấy các pixel depth đáng
+# tin trong vùng lower-central của bbox, loại invalid/outlier, lấy median rồi
+# dùng camera intrinsics để unproject thành XYZ. Nếu có extrinsic, điểm camera
+# tiếp tục được đổi sang ego frame; nếu thiếu, chỉ có khoảng cách từ camera.
+
 def estimate_object_depth(
     detection: Detection,
     depth_z_m: np.ndarray,
@@ -718,6 +842,10 @@ def estimate_object_depth(
 # BLOCK 8 — PIPELINE INFERENCE TRÊN ẢNH THẬT
 # =============================================================================
 
+# Lớp orchestration cấp ứng dụng: chuẩn hóa/resize ảnh, chạy Block 4, gọi Block 6
+# để có bbox, resize depth map về ảnh gốc, gọi Block 7 cho từng bbox, gán safety
+# band và cung cấp hàm annotate. Block này không train và không sửa trọng số.
+
 class InferencePipeline:
     """Tiền xử lý ảnh, forward, decode, depth fusion và safety banding."""
 
@@ -755,6 +883,9 @@ class InferencePipeline:
         tensor = torch.from_numpy(array).permute(2, 0, 1)[None].to(self.device)
         with torch.inference_mode():
             output = self.model(tensor)
+            inference_depth = self.model.metric_depth_from_logits(
+                output.depth_logits, modal_radius=DEPTH_MODAL_RADIUS
+            )
         # Bbox decode hiện nằm trong không gian ảnh resize.
         decoded = self.model.decode(
             output, self.input_hw, score_threshold=score_threshold
@@ -762,7 +893,7 @@ class InferencePipeline:
         # Metric value được bilinear-resample về ảnh gốc; chỉ thay đổi sampling
         # grid, không đổi đơn vị mét của depth.
         depth = F.interpolate(
-            output.depth_m[:, None],
+            inference_depth[:, None],
             size=(original_h, original_w),
             mode="bilinear",
             align_corners=False,
@@ -847,6 +978,12 @@ class InferencePipeline:
 # =============================================================================
 # BLOCK 9 — NAVSIM RAW DATA: INDEX, GT PROJECTION VÀ SPARSE DEPTH
 # =============================================================================
+
+# Adapter dữ liệu và vòng đời training/validation. Phần này đọc NAVSIM thô, đổi
+# label/coordinate sang contract của Block 3, chiếu box/LiDAR lên camera, tạo
+# Dataset/DataLoader, chia train-validation theo recording, chạy optimizer và
+# xuất checkpoint, prediction image, GT image, result JSON. Đây là block lớn vì
+# nó chứa cả data preparation lẫn experiment runner, không phải kiến trúc model.
 
 # NAVSIM mini dùng semantic name từ annotation 3D. Mapping được khai báo tường
 # minh; tuyệt đối không đoán VRU bằng kích thước bbox.
@@ -1099,7 +1236,7 @@ def sparse_camera_depth(
     v = np.floor(projected[:, 1] / safe_z).astype(np.int64)
     valid = (
         (z >= DEPTH_MIN_M)
-        & (z <= float(DEPTH_MIN_M + (DEPTH_BINS - 1) * DEPTH_STEP_M))
+        & (z <= DEPTH_MAX_M)
         & (u >= 0) & (u < output_w)
         & (v >= 0) & (v < output_h)
     )
@@ -1466,10 +1603,7 @@ def run_navsim_smoke(args: argparse.Namespace) -> None:
             "--init-checkpoint and --resume-smoke-checkpoint are mutually exclusive"
         )
     if args.init_checkpoint:
-        initial_payload = torch.load(
-            args.init_checkpoint, map_location=device, weights_only=True
-        )
-        model.load_state_dict(initial_payload["model"])
+        initial_payload = load_checkpoint(model, args.init_checkpoint)
         step = int(initial_payload.get("step", 0))
         print(
             f"initialized from checkpoint={args.init_checkpoint} step={step}; "
@@ -1477,10 +1611,7 @@ def run_navsim_smoke(args: argparse.Namespace) -> None:
             flush=True,
         )
     if args.resume_smoke_checkpoint:
-        resume_payload = torch.load(
-            args.resume_smoke_checkpoint, map_location=device, weights_only=True
-        )
-        model.load_state_dict(resume_payload["model"])
+        resume_payload = load_checkpoint(model, args.resume_smoke_checkpoint)
         checkpoint_image_hw = tuple(
             resume_payload.get("config", {}).get("image_hw", image_hw)
         )
@@ -1601,6 +1732,10 @@ def run_navsim_smoke(args: argparse.Namespace) -> None:
                 "step": step,
                 "config": {
                     "image_hw": image_hw,
+                    "depth_binning": DEPTH_BINNING,
+                    "depth_range_m": [DEPTH_MIN_M, DEPTH_MAX_M],
+                    "depth_bins": DEPTH_BINS,
+                    "inference_modal_radius": DEPTH_MODAL_RADIUS,
                     "depth_weight": args.depth_weight,
                     "train_samples": len(train_records),
                     "validation_log": validation_log,
@@ -1699,13 +1834,17 @@ def run_navsim_smoke(args: argparse.Namespace) -> None:
         validation_item = validation_dataset[validation_index]
         with torch.inference_mode():
             validation_output = model(validation_item["image"][None].to(device))
+            validation_depth = model.metric_depth_from_logits(
+                validation_output.depth_logits,
+                modal_radius=DEPTH_MODAL_RADIUS,
+            )[0]
         sparse_gt = validation_item["depth"].to(device)
         sparse_valid = sparse_gt > 0
         valid_count = int(sparse_valid.sum())
         sample_depth_mae = None
         if valid_count:
             absolute_error = (
-                validation_output.depth_m[0] - sparse_gt
+                validation_depth - sparse_gt
             ).abs()[sparse_valid]
             depth_absolute_error += float(absolute_error.sum())
             depth_valid_pixels += valid_count
@@ -1763,7 +1902,7 @@ def run_navsim_smoke(args: argparse.Namespace) -> None:
     result_path.write_text(
         json.dumps(
             {
-                "status": "pipeline_smoke_only_not_accuracy_evidence",
+                "status": "held_out_validation_not_independent_test",
                 "token": validation_record["token"],
                 "validation_log": validation_log,
                 "train_samples": len(train_records),
@@ -1772,6 +1911,10 @@ def run_navsim_smoke(args: argparse.Namespace) -> None:
                 "validation_samples": len(validation_records),
                 "image_hw": image_hw,
                 "checkpoint_training_image_hw": checkpoint_image_hw,
+                "depth_binning": DEPTH_BINNING,
+                "depth_range_m": [DEPTH_MIN_M, DEPTH_MAX_M],
+                "depth_bins": DEPTH_BINS,
+                "inference_modal_radius": DEPTH_MODAL_RADIUS,
                 "evaluation_resolution_matches_checkpoint": (
                     image_hw == checkpoint_image_hw
                 ),
@@ -1991,6 +2134,10 @@ def run_navsim_e2e(args: argparse.Namespace) -> None:
 # BLOCK 10 — CHECKPOINT I/O
 # =============================================================================
 
+# Biên an toàn giữa trọng số lưu trên đĩa và runtime. Ngoài việc load state_dict,
+# block kiểm tra depth-binning semantics cùng missing/unexpected keys để không vô
+# tình diễn giải checkpoint linear-bin cũ bằng log-bin hiện tại.
+
 def load_checkpoint(model: nn.Module, checkpoint_path: str) -> dict[str, Any]:
     """Nạp checkpoint và fail-fast nếu kiến trúc không khớp.
 
@@ -1998,9 +2145,18 @@ def load_checkpoint(model: nn.Module, checkpoint_path: str) -> dict[str, Any]:
     do DDP tạo ra. Không cho phép âm thầm bỏ head thiếu/thừa.
     """
     try:
-        raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        raw = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     except TypeError:
         raw = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(raw, dict) and "model" in raw:
+        actual_binning = raw.get("config", {}).get("depth_binning")
+        if actual_binning != DEPTH_BINNING:
+            raise ValueError(
+                "checkpoint depth semantics are incompatible: "
+                f"checkpoint={actual_binning or 'legacy_linear_or_unknown'} "
+                f"runtime={DEPTH_BINNING}. Retrain with --navsim-e2e; "
+                "do not decode linear-bin weights with log bins."
+            )
     state = raw.get("model", raw)
     state = {key.replace("module.", ""): value for key, value in state.items()}
     missing, unexpected = model.load_state_dict(state, strict=False)
@@ -2016,6 +2172,9 @@ def load_checkpoint(model: nn.Module, checkpoint_path: str) -> dict[str, Any]:
 # BLOCK 11 — SELF-TEST KHÔNG CẦN DATA/CHECKPOINT
 # =============================================================================
 
+# Sanity test nhanh cho wiring và invariants, không phải benchmark accuracy. Nó
+# bắt các lỗi shape, bin endpoints/spacing, bbox decode và phép tính 3D cơ bản.
+
 def self_test() -> None:
     """Kiểm tra shape forward và phép tính bbox-depth bằng dữ liệu tổng hợp."""
     torch.manual_seed(0)
@@ -2025,6 +2184,26 @@ def self_test() -> None:
         output = model(image)
     assert output.depth_logits.shape == (1, 64, 32, 48)
     assert output.depth_m.shape == (1, 32, 48)
+    centres = model.depth_centres_m
+    assert abs(float(centres[0]) - DEPTH_MIN_M) < 1e-5
+    assert abs(float(centres[-1]) - DEPTH_MAX_M) < 1e-4
+    assert bool(torch.all(centres[1:] > centres[:-1]))
+    # Geometric spacing: tỉ số gần như hằng, còn khoảng cách tuyệt đối tăng.
+    ratios = centres[1:] / centres[:-1]
+    assert float((ratios - ratios.mean()).abs().max()) < 1e-5
+    assert float(centres[1] - centres[0]) < float(centres[-1] - centres[-2])
+    centre_coordinates = model.metric_depth_to_bin(centres)
+    assert torch.allclose(
+        centre_coordinates,
+        torch.arange(DEPTH_BINS, dtype=centre_coordinates.dtype),
+        atol=1e-4,
+    )
+    synthetic_logits = torch.full((1, DEPTH_BINS, 1, 1), -20.0)
+    synthetic_logits[:, 12] = 20.0
+    modal_depth = model.metric_depth_from_logits(
+        synthetic_logits, modal_radius=DEPTH_MODAL_RADIUS
+    )
+    assert abs(float(modal_depth) - float(centres[12])) < 1e-4
     assert [tuple(t.shape) for t in output.heatmaps] == [
         (1, 2, 32, 48),
         (1, 2, 16, 24),
@@ -2060,6 +2239,9 @@ def self_test() -> None:
 # =============================================================================
 # BLOCK 12 — COMMAND-LINE ENTRYPOINT
 # =============================================================================
+
+# Router CLI. Thứ tự ưu tiên là self-test -> E2E -> một NAVSIM stage -> inference
+# một ảnh. Nhánh inference bắt buộc có ảnh, checkpoint và camera intrinsics.
 
 def main() -> None:
     """CLI cho E2E NAVSIM training, stage nâng cao, self-test và inference."""

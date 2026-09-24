@@ -12,7 +12,7 @@ Model triển khai phần image-space lấy cảm hứng từ METEOR:
 CAM_F0 RGB
   → ResNet-34 ImageNet backbone
   → top-down FPN C5→C2, 160 channels
-       ├─ P2/s4 depth head: 64 bins, 1.0–79.75 m
+       ├─ P2/s4 depth head: 64 log-spaced bins, 1.0–79.75 m
        ├─ P2/s4 detector: object <40 px
        ├─ P3/s8 detector: object 40–120 px
        └─ P4/s16 detector: object ≥120 px
@@ -158,8 +158,18 @@ cấp frame, không sửa gradient của từng object.
 Depth loss:
 
 ```text
-64-bin cross entropy + 0.1 × metric L1
+64 geometric/log-bin cross entropy + 0.1 × continuous metric L1
 ```
+
+Tâm bin khớp METEOR `depth_log_bins`:
+
+```text
+center(i) = exp(log(1.0) + i/63 × (log(79.75) - log(1.0)))
+```
+
+GT camera-Z được `bucketize` rồi nội suy giữa hai tâm kề nhau trước khi tạo CE
+target. Train dùng full expected metric depth; inference dùng expectation trong
+modal bin ±2 giống đường deployment METEOR để tránh trộn foreground/background.
 
 Loss tổng:
 
@@ -200,3 +210,25 @@ py -3.12 model.py `
 - Không coi loss giảm hoặc một ảnh đẹp là bằng chứng model đủ an toàn.
 
 Checkpoint/dataset/output nằm trong `artifacts/` và không được commit lên Git.
+Checkpoint linear-bin cũ không tương thích và bị từ chối khi load; phải train
+lại bằng `--navsim-e2e` sau thay đổi log-bin.
+
+## 9. Kết quả log-bin hiện tại
+
+Full E2E log-bin đã chạy 2.112 step trên GPU và đánh giá 128 frame held-out,
+score threshold 0.20, IoU ≥0.5:
+
+| Metric | Linear-bin cũ | Log-bin mới |
+|---|---:|---:|
+| Vehicle TP / FP / FN | 50 / 59 / 21 | **51 / 55 / 20** |
+| VRU TP / FP / FN | 57 / 93 / 232 | **59 / 95 / 230** |
+| VRU precision / recall | 38,0% / 19,7% | **38,3% / 20,4%** |
+| Near-VRU≤30 m TP / FN | 20 / 63 | **23 / 60** |
+| Near-VRU recall | 24,1% | **27,7%** |
+| VRU object camera-Z MAE | 7,68 m | **6,56 m** |
+| Near-VRU object camera-Z MAE | 5,10 m | **4,98 m** |
+| Sparse pixel depth MAE | **4,93 m** | 5,29 m |
+
+Log-bin cải thiện mục tiêu object/near-VRU nhưng sparse pixel MAE kém hơn. Đây
+là validation trên recording đã dùng để chọn cấu hình, chưa phải test độc lập
+và chưa đủ độ chính xác cho quyết định an toàn.
