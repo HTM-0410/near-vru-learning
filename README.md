@@ -116,7 +116,8 @@ py -3.12 model.py `
   --smoke-output-dir "artifacts\navsim_quick"
 ```
 
-`quick` chỉ chứng minh pipeline chạy được, không phải bằng chứng accuracy.
+`quick` chạy hai phase nhỏ để kiểm tra cả truyền checkpoint progressive và tự
+xoá stage tạm; nó chỉ chứng minh pipeline chạy được, không phải accuracy.
 
 ## 5. Inference một ảnh
 

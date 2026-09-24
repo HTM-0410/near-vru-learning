@@ -1855,9 +1855,9 @@ def run_navsim_e2e(args: argparse.Namespace) -> None:
     if args.e2e_profile == "quick":
         phases = [
             {
-                "name": "quick",
-                "train_samples": 8,
-                "validation_samples": 4,
+                "name": "quick_stage1",
+                "train_samples": 4,
+                "validation_samples": 2,
                 "epochs": 1,
                 "batch_size": 2,
                 "image_width": 192,
@@ -1865,7 +1865,19 @@ def run_navsim_e2e(args: argparse.Namespace) -> None:
                 "learning_rate": 1e-4,
                 "depth_weight": 0.10,
                 "unfreeze_backbone_stages": 0,
-            }
+            },
+            {
+                "name": "quick_final",
+                "train_samples": 8,
+                "validation_samples": 4,
+                "epochs": 1,
+                "batch_size": 2,
+                "image_width": 256,
+                "image_height": 160,
+                "learning_rate": 5e-5,
+                "depth_weight": 0.10,
+                "unfreeze_backbone_stages": 0,
+            },
         ]
     else:
         phases = [
